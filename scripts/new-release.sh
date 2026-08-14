@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Create and publish a Bear & Moose CA release.
+# Create and publish a Now release.
 #
 # Flow: feature -> dev -> release/vX.Y.Z -> main, then main -> dev.
-# conf/settings.cfg records the source-tree version and must match the annotated
+# etc/settings.cfg records the source-tree version and must match the annotated
 # vX.Y.Z release tag. Each release also promotes the CHANGELOG.md Unreleased
 # section to a dated release section. This script does not package or copy CA
 # state, private keys, or other secrets.
 
-set -Eeuo pipefail
+set -euo pipefail
 
 readonly REMOTE="origin"
 readonly MAIN_BRANCH="main"
 readonly DEV_BRANCH="dev"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-readonly SETTINGS_FILE="$PROJECT_DIR/conf/settings.cfg"
+readonly SETTINGS_FILE="$PROJECT_DIR/etc/settings.cfg"
 
 CURRENT_BRANCH=""
 PROJECT_NAME=""
@@ -41,15 +41,33 @@ error()   { printf '%s[ERROR]%s %s\n' "$RED" "$NC" "$*" >&2; }
 die()     { error "$*"; exit 1; }
 
 usage() {
+    local example_version="0.1.0"
+    local example_message="Release v0.1.0"
+    local example_branch="feat/maint-0.1.1"
+
+    if [[ ${1:-} == current && -f "$SETTINGS_FILE" ]]; then
+        local current_version
+        current_version=$(sed -nE 's/^PROJECT_VERSION="([^"]+)"$/\1/p' "$SETTINGS_FILE")
+        if [[ "$current_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            local major=${BASH_REMATCH[1]}
+            local minor=${BASH_REMATCH[2]}
+            local release_patch=$((10#${BASH_REMATCH[3]} + 1))
+            local maintenance_patch=$((release_patch + 1))
+            example_version="$major.$minor.$release_patch"
+            example_message="Release v$example_version"
+            example_branch="feat/maint-$major.$minor.$maintenance_patch"
+        fi
+    fi
+
     cat <<EOF
 Usage: $(basename -- "$0") <version> <release-message> <next-feature-branch>
 
 Example:
-  $(basename -- "$0") 0.1.0 "Bear & Moose CA 0.1.0" feat/backup-restore
+  $(basename -- "$0") $example_version "$example_message" $example_branch
 
 The script must be run from a clean feat/* or feature/* branch. It fetches
 $REMOTE, validates the release refs, asks for confirmation, performs the
-release merges, updates conf/settings.cfg and CHANGELOG.md, and atomically
+release merges, updates etc/settings.cfg and CHANGELOG.md, and atomically
 pushes main, dev, the release branch, and tag.
 EOF
 }
@@ -84,10 +102,11 @@ validate_arguments() {
 }
 
 preflight() {
-    require_command git
+    local current_version
+
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a Git repository."
     [[ "$(git rev-parse --show-toplevel)" == "$PROJECT_DIR" ]] ||
-        die "Run this script from the bmca repository."
+        die "Run this script from the Now repository."
     git remote get-url "$REMOTE" >/dev/null 2>&1 || die "Git remote '$REMOTE' is not configured."
 
     CURRENT_BRANCH=$(git branch --show-current)
@@ -99,16 +118,19 @@ preflight() {
         die "Working tree is not clean; commit or stash changes before releasing."
     }
 
-    [[ -f "$SETTINGS_FILE" ]] || die "conf/settings.cfg is required for a release."
-    local current_version
+    [[ -f "$SETTINGS_FILE" ]] || die "etc/settings.cfg is required for a release."
     PROJECT_NAME=$(sed -nE 's/^PROJECT_NAME="([^"]+)"$/\1/p' "$SETTINGS_FILE")
     current_version=$(sed -nE 's/^PROJECT_VERSION="([^"]+)"$/\1/p' "$SETTINGS_FILE")
     [[ -n "$PROJECT_NAME" ]] ||
-        die "PROJECT_NAME is missing or invalid in conf/settings.cfg."
+        die "PROJECT_NAME is missing or invalid in etc/settings.cfg."
     [[ "$current_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] ||
-        die "PROJECT_VERSION in conf/settings.cfg is missing or invalid: $current_version"
+        die "PROJECT_VERSION in etc/settings.cfg is missing or invalid: $current_version"
     [[ "$current_version" != "$NEW_VERSION" ]] ||
         die "PROJECT_VERSION is already $NEW_VERSION; choose a new release version."
+
+    [[ -f "$PROJECT_DIR/CHANGELOG.md" ]] || die "CHANGELOG.md is required for a release."
+    grep -Fxq '## [Unreleased]' "$PROJECT_DIR/CHANGELOG.md" ||
+        die "CHANGELOG.md does not contain the required '## [Unreleased]' heading."
 
     if git grep -I -n -E -- '-----BEGIN (ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----' -- .; then
         die "A private-key PEM marker was found in tracked files; remove the secret before releasing."
@@ -172,10 +194,6 @@ update_changelog() {
     local changelog="$PROJECT_DIR/CHANGELOG.md"
     local release_date release_heading temp_file
 
-    [[ -f "$changelog" ]] || die "CHANGELOG.md is required for a release."
-    grep -Fxq '## [Unreleased]' "$changelog" ||
-        die "CHANGELOG.md does not contain the required '## [Unreleased]' heading."
-
     release_date=$(date '+%Y-%m-%d %H:%M %Z')
     release_heading="## [Release $NEW_VERSION] - $release_date"
     temp_file=$(mktemp "$PROJECT_DIR/.CHANGELOG.md.XXXXXX")
@@ -201,7 +219,7 @@ update_changelog() {
 
 update_project_version() {
     local temp_file
-    temp_file=$(mktemp "$PROJECT_DIR/conf/.settings.cfg.XXXXXX")
+    temp_file=$(mktemp "$PROJECT_DIR/etc/.settings.cfg.XXXXXX")
 
     if ! awk -v version="$NEW_VERSION" '
         /^PROJECT_VERSION="[^"]+"$/ {
@@ -211,12 +229,12 @@ update_project_version() {
         { print }
     ' "$SETTINGS_FILE" >"$temp_file"; then
         rm -f -- "$temp_file"
-        die "Failed to update PROJECT_VERSION in conf/settings.cfg."
+        die "Failed to update PROJECT_VERSION in etc/settings.cfg."
     fi
 
     chmod --reference="$SETTINGS_FILE" "$temp_file"
     mv -- "$temp_file" "$SETTINGS_FILE"
-    git add -- conf/settings.cfg
+    git add -- etc/settings.cfg
     success "Updated PROJECT_VERSION to $NEW_VERSION."
 }
 
@@ -249,6 +267,8 @@ create_release() {
 main() {
     cd -- "$PROJECT_DIR"
     if [[ ${1:-} == -h || ${1:-} == --help ]]; then usage; exit 0; fi
+    if [[ $# -eq 0 ]]; then usage current >&2; exit 2; fi
+    require_command git
     validate_arguments "$@"
     preflight
     confirm_release
@@ -256,7 +276,7 @@ main() {
 
     success "Release $TAG_NAME was published successfully."
     success "Now on new feature branch: $NEXT_FEATURE_BRANCH"
-    info "Deploy Paris from the signed-off Git tag '$TAG_NAME', not from a working branch."
+    info "Deploy Now from the signed-off Git tag '$TAG_NAME', not from a working branch."
 }
 
 main "$@"
